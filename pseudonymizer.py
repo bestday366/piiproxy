@@ -5,7 +5,11 @@ import re
 import threading
 from dataclasses import dataclass, field
 
-from .patterns import PATTERNS
+from .patterns import PATTERNS, MODE_SINGLE, MODE_SEGMENTS
+
+# Разделители сегментов для режима MODE_SEGMENTS (захватываются, чтобы
+# сохраниться в результате re.split).
+_SEP_RE = re.compile(r"([./])")
 
 
 @dataclass
@@ -15,9 +19,17 @@ class SessionMap:
     decode: dict[str, str] = field(default_factory=dict)  # токен → оригинал
     counters: dict[str, int] = field(default_factory=dict)
 
-    def add(self, label: str, original: str) -> str:
+    def add(self, label: str, original: str, single: bool = False) -> str:
         if original in self.encode:
             return self.encode[original]
+        if single:
+            # Новый токен не создаётся: все совпадения паттерна
+            # подставляются одним токеном с начальным индексом.
+            token = f"[{label}_1]"
+            self.encode[original] = token
+            # Декодируется в первое встреченное значение.
+            self.decode.setdefault(token, original)
+            return token
         self.counters[label] = self.counters.get(label, 0) + 1
         token = f"[{label}_{self.counters[label]}]"
         self.encode[original] = token
@@ -38,7 +50,7 @@ class Pseudonymizer:
         p.clear(session_id)   # освободить память
     """
 
-    def __init__(self, patterns: list[tuple[str, re.Pattern]] = PATTERNS):
+    def __init__(self, patterns: list[tuple[str, re.Pattern, str]] = PATTERNS):
         self._patterns = patterns
         self._sessions: dict[str, SessionMap] = {}
         self._lock = threading.Lock()
@@ -52,9 +64,19 @@ class Pseudonymizer:
     def encode(self, session_id: str, text: str) -> str:
         """Заменяет PII на токены, запоминает маппинг."""
         smap = self._get_or_create(session_id)
-        for label, pattern in self._patterns:
-            def replace(m, _label=label, _smap=smap):
-                return _smap.add(_label, m.group(0))
+        for label, pattern, mode in self._patterns:
+            if mode == MODE_SEGMENTS:
+                def replace(m, _label=label, _smap=smap):
+                    # Разделители ('.' или '/') сохраняются, сегменты
+                    # токенизируются стабильно — пакет и директория получают
+                    # одинаковые имена сегментов, но обратимы по-разному.
+                    return "".join(
+                        part if _SEP_RE.fullmatch(part) else _smap.add(_label, part)
+                        for part in _SEP_RE.split(m.group(0))
+                    )
+            else:
+                def replace(m, _label=label, _smap=smap, _single=(mode == MODE_SINGLE)):
+                    return _smap.add(_label, m.group(0), _single)
             text = pattern.sub(replace, text)
         return text
 
