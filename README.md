@@ -30,7 +30,7 @@ python -m venv .venv
 
 алиас:
 ```bash
-alias pii-proxy="~/.local/share/pii-proxy/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8181 --app-dir ~/.local/share/pii-proxy"
+alias piiproxy="~/.local/share/pii-proxy/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8181 --app-dir ~/.local/share/pii-proxy"
 ```
 
 ## Запуск
