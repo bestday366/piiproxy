@@ -111,52 +111,131 @@ def filter_system(session_id: str, system) -> str | list | None:
     return encode_content(session_id, system)
 
 
-def _decode_safe(session_id: str, buffer: str) -> tuple[str, str]:
+def _decode_tree(session_id: str, value):
     """
-    Декодирует завершённые токены в буфере.
-    Незавершённый токен в конце буфера (открытая скобка без закрытой)
-    остаётся в буфере до следующего чанка.
+    Рекурсивно декодирует токены во всех строках структуры.
+    Используется для tool_use.input в не-streaming ответе: содержимое
+    записываемого файла приходит как аргумент инструмента (Write/Edit),
+    а не как text-блок, поэтому его нужно декодировать отдельно.
     """
+    if isinstance(value, str):
+        return pseudonymizer.decode(session_id, value)
+    if isinstance(value, list):
+        return [_decode_tree(session_id, v) for v in value]
+    if isinstance(value, dict):
+        return {k: _decode_tree(session_id, v) for k, v in value.items()}
+    return value
+
+
+def _sse(event: dict) -> bytes:
+    """Сериализует событие в SSE-строку data:."""
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+
+
+class _StreamDecoder:
+    """
+    Декодирует токены в SSE-потоке Anthropic с буферизацией незавершённых
+    токенов.
+
+    Декодируются дельты двух типов:
+        text_delta       — обычный текст ответа (поле delta.text).
+        input_json_delta — аргументы инструмента (поле delta.partial_json):
+                            именно так приходит содержимое записываемого
+                            файла (Write/Edit). Без этой ветки файл писался
+                            бы с токенами [BASEPACKAGENAMESRC_n] внутри.
+
+    Буфер и тип текущего блока хранятся как состояние: незавершённый токен
+    на конце дельты придерживается до следующей дельты, а на границе блока
+    (content_block_stop) остаток сбрасывается дельтой того же типа.
+
+    partial_json — сериализованный JSON-фрагмент; декодирование подменяет
+    токен на оригинал внутри строкового значения. Это безопасно для PII
+    данного проекта (имена пакетов/орг: без ", \\, переводов строк), но
+    оригинал со спецсимволами JSON потребовал бы повторного экранирования.
+    """
+
     # [A-Z_]* (а не +): буфер может оборваться сразу после открывающей '['
     # — например на стыке соседних токенов сегментов ('[...].[...]').
     # С '+' одиночная '[' в конце не распознавалась как начало токена,
     # отдавалась клиенту раньше времени, и следующий токен терял '['
     # и больше не декодировался.
-    incomplete = re.search(r"\[[A-Z_]*(?:_\d+)?$", buffer)
-    if incomplete:
-        safe_part = buffer[:incomplete.start()]
-        remaining = buffer[incomplete.start():]
-    else:
-        safe_part = buffer
-        remaining = ""
-    return pseudonymizer.decode(session_id, safe_part), remaining
+    _INCOMPLETE_RE = re.compile(r"\[[A-Z_]*(?:_\d+)?$")
 
+    def __init__(self, pii: Pseudonymizer, session_id: str):
+        self._pii = pii
+        self._sid = session_id
+        self._buffer = ""
+        self._kind: str | None = None   # text_delta | input_json_delta
+        self._index = 0
 
-def _process_sse_line(session_id: str, line: str, buffer: str) -> tuple[bytes, str]:
-    """
-    Обрабатывает одну SSE-строку: декодирует PII в text_delta событиях.
-    Возвращает (bytes_to_send, updated_buffer).
-    """
-    if not line.startswith("data: "):
-        return f"{line}\n\n".encode(), buffer
+    def _decode_safe(self, text: str) -> str:
+        """Декодирует, придерживая незавершённый токен на конце в буфере."""
+        self._buffer += text
+        m = self._INCOMPLETE_RE.search(self._buffer)
+        if m:
+            safe, self._buffer = self._buffer[:m.start()], self._buffer[m.start():]
+        else:
+            safe, self._buffer = self._buffer, ""
+        return self._pii.decode(self._sid, safe)
 
-    raw = line[6:]
-    if raw == "[DONE]":
-        return b"data: [DONE]\n\n", buffer
+    def _flush(self) -> bytes:
+        """
+        Сбрасывает остаток буфера на границе блока: здесь это полноценное
+        значение поля, незавершённых токенов быть не может — декодируем целиком.
+        """
+        if not self._buffer or not self._kind:
+            self._buffer = ""
+            return b""
+        decoded = self._pii.decode(self._sid, self._buffer)
+        self._buffer = ""
+        if not decoded:
+            return b""
+        field = "text" if self._kind == "text_delta" else "partial_json"
+        return _sse({
+            "type": "content_block_delta",
+            "index": self._index,
+            "delta": {"type": self._kind, field: decoded},
+        })
 
-    try:
-        event = json.loads(raw)
-        if (
-            event.get("type") == "content_block_delta"
-            and event.get("delta", {}).get("type") == "text_delta"
-        ):
-            buffer += event["delta"]["text"]
-            decoded, buffer = _decode_safe(session_id, buffer)
-            event["delta"]["text"] = decoded
+    def process_line(self, line: str) -> bytes:
+        """Обрабатывает одну SSE-строку, возвращает байты для клиента."""
+        if not line.startswith("data: "):
+            return f"{line}\n\n".encode()
 
-        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode(), buffer
-    except json.JSONDecodeError:
-        return f"{line}\n\n".encode(), buffer
+        raw = line[6:]
+        if raw == "[DONE]":
+            return b"data: [DONE]\n\n"
+
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return f"{line}\n\n".encode()
+
+        etype = event.get("type")
+        if etype == "content_block_start":
+            # Новый блок — буфер предыдущего уже сброшен на его stop.
+            self._index = event.get("index", self._index)
+            self._kind = None
+            self._buffer = ""
+        elif etype == "content_block_delta":
+            self._index = event.get("index", self._index)
+            delta = event.get("delta", {})
+            dtype = delta.get("type")
+            if dtype == "text_delta":
+                self._kind = "text_delta"
+                delta["text"] = self._decode_safe(delta.get("text", ""))
+            elif dtype == "input_json_delta":
+                self._kind = "input_json_delta"
+                delta["partial_json"] = self._decode_safe(delta.get("partial_json", ""))
+        elif etype == "content_block_stop":
+            self._index = event.get("index", self._index)
+            return self._flush() + _sse(event)
+
+        return _sse(event)
+
+    def finish(self) -> bytes:
+        """Сбрасывает остаток буфера при завершении потока (обрыв без stop)."""
+        return self._flush()
 
 
 async def _collect_stream(
@@ -175,7 +254,7 @@ async def _collect_stream(
     passthrough=True — в сессии не было замен PII, ответ не может содержать
     токены, поэтому байты пересылаются как есть без разбора SSE/JSON.
     """
-    buffer = ""
+    decoder = _StreamDecoder(pseudonymizer, session_id)
     try:
         async with client.stream(
             "POST",
@@ -205,21 +284,12 @@ async def _collect_stream(
                     if not line:
                         await queue.put(b"\n")
                         continue
-                    chunk, buffer = _process_sse_line(session_id, line, buffer)
-                    await queue.put(chunk)
+                    await queue.put(decoder.process_line(line))
 
-        # Сбрасываем остаток буфера
-        if buffer:
-            decoded = pseudonymizer.decode(session_id, buffer)
-            if decoded:
-                event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": decoded},
-                }
-                await queue.put(
-                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
-                )
+        # Сбрасываем остаток буфера (на случай обрыва потока без stop-события)
+        tail = decoder.finish()
+        if tail:
+            await queue.put(tail)
     except asyncio.CancelledError:
         pass  # клиент отключился — чистый выход
     except Exception as e:
@@ -336,6 +406,10 @@ async def proxy_messages(request: Request):
             for block in resp_body["content"]:
                 if block.get("type") == "text":
                     block["text"] = pseudonymizer.decode(session_id, block["text"])
+                elif block.get("type") == "tool_use" and "input" in block:
+                    # Содержимое записываемого файла приходит здесь, а не в
+                    # text-блоке — декодируем аргументы инструмента рекурсивно.
+                    block["input"] = _decode_tree(session_id, block["input"])
 
         pseudonymizer.clear(session_id)
         return Response(
